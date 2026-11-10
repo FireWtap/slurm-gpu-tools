@@ -1,6 +1,7 @@
 # slurm-gpu-tools
 
 Small, read-only helpers for finding GPUs on a Slurm cluster. No root, no accounting DB needed: only `sinfo`.
+This project stems from my own necessities: I often find my self working with a SLURM cluster and it can be convoluted and hard to figure out exactly how to operate it with the overhead there is. Sometimes simple things should be simple. I hope this tool can be as useful to others as it is for me.
 
 ## sgpu
 
@@ -26,10 +27,8 @@ sgpu -c 16 -m 64     size of one 1-GPU job: 16 CPUs, 64 GB (defaults 8 CPU / 24 
 `FITS = min(free GPUs, free CPUs / c, free GB / m)`. Nodes that are drained, down, failed or in maintenance count as 0.
 GPU counts come from `sinfo -O Gres,GresUsed`, so GRES must be `gpu:<type>:<n>` or `gpu:<n>`.
 
-Tested on: DAS-6 (Slurm 20.11, 3x A6000 per node).
-
 ## Install
 
 ```
-git clone <this repo> ~/slurm-gpu-tools && ~/slurm-gpu-tools/install.sh   # symlinks bin/* into ~/.local/bin
+git clone <this repo> ~/slurm-gpu-tools && ~/slurm-gpu-tools/install.sh   # symlinks bin/* into ~/.local/bin. You can also simply add the repo to your $PATH manually.
 ```
