@@ -27,8 +27,10 @@ sgpu -c 16 -m 64     size of one 1-GPU job: 16 CPUs, 64 GB (defaults 8 CPU / 24 
 ```
 
 `GPU` is the GRES type (`gpu:A6000:3`), or, if the GRES is untyped (`gpu:4`), the first GPU-like node feature (e.g. `TitanRTX`).
-`FITS = min(free GPUs, free CPUs / c, free GB / m)`. Nodes that are drained, down, failed or in maintenance count as 0.
-GPU counts come from `sinfo -O Gres,GresUsed`, so GRES must be `gpu:<type>:<n>` or `gpu:<n>`.
+`FITS = min(free GPUs, free CPUs / c, free GB / m)`. Nodes that are drained, down, failed or in maintenance count as 0; *planned* nodes (state ending in `-`, held by the
+backfill scheduler for a waiting job) have FITS 0; *completing* nodes are counted (their GPUs free up shortly).
+GPU counts come from `sinfo -O Gres,GresUsed`: every `gpu[:type]:<n>` entry is summed; other GRES (e.g. Snellius'
+`cpu:72`) and `(S:..)`/`(IDX:..)` annotations are ignored. Tested on DAS-6 (A6000) and Snellius (A100, H100, MIG).
 
 ## swhen
 

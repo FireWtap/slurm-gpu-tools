@@ -25,14 +25,20 @@ done
 
 sinfo -N -h ${part:+-p "$part"} -O "NodeHost:30,Partition:20,Gres:40,GresUsed:60,CPUsState:24,AllocMem:14,Memory:14,StateLong:20,Features:80" |
 awk -v only_fit="$only_fit" -v show_all="$show_all" -v cpus="$cpus" -v mem="$mem" '
-function gtype(gres, feat,    a, n, i, f) {           # GPU model: GRES type (gpu:A6000:3), else a GPU-like node feature
-  sub(/\(.*/, "", gres); n = split(gres, a, ":"); if (n >= 3 && a[2] !~ /^[0-9]+$/) return a[2]
+function strip(s) { gsub(/\([^)]*\)/, "", s); return s }      # "gpu:a100:2(IDX:0,2),cpu:54" -> "gpu:a100:2,cpu:54"
+function gpus(s,    n, a, i, k, b, t) {                      # sum of all gpu entries; other GRES (cpu:72, shard:..) ignored
+  n = split(strip(s), a, ","); t = 0
+  for (i = 1; i <= n; i++) if (a[i] ~ /^gpu/) { k = split(a[i], b, ":"); t += (b[k] ~ /^[0-9]+$/) ? b[k] : 1 }
+  return t
+}
+function gtype(gres, feat,    a, n, i, b, f) {           # GPU model: GRES type (gpu:A6000:3), else a GPU-like node feature
+  n = split(strip(gres), a, ",")
+  for (i = 1; i <= n; i++) if (a[i] ~ /^gpu/ && split(a[i], b, ":") >= 3 && b[2] !~ /^[0-9]+$/) return b[2]
   n = split(feat, f, ",")
   for (i = 1; i <= n; i++) if (f[i] ~ /([Tt]itan|GTX|RTX|[Tt]esla|^[AHLV][0-9]+|[AHLV]100|MI[0-9]+|[Qq]uadro|[Gg]eForce)/) return f[i]
   return "-"
 }
-function gpus(s,    n, a) { sub(/\(.*/, "", s); if (s !~ /^gpu/) return 0; n = split(s, a, ":"); return a[n] + 0 }
-BEGIN { printf "%-12s %-10s %-10s %9s %10s %12s %5s  %s\n", "NODE", "PART", "GPU", "GPU free", "CPU free", "MEM free GB", "FITS", "STATE" }
+BEGIN { printf "%-12s %-10s %-14s %9s %10s %12s %5s  %s\n", "NODE", "PART", "GPU", "GPU free", "CPU free", "MEM free GB", "FITS", "STATE" }
 !seen[$1]++ {
   node = $1; p = $2; sub(/\*$/, "", p)
   gt = gpus($3); gu = gpus($4)                        # Gres gpu:A6000:3 / GresUsed gpu:A6000:1(IDX:0)
@@ -41,9 +47,13 @@ BEGIN { printf "%-12s %-10s %-10s %9s %10s %12s %5s  %s\n", "NODE", "PART", "GPU
   gf = gt - gu; if (st ~ /drain|down|maint|reserved|fail/) gf = 0
   fit = gf; if (int(cf / cpus) < fit) fit = int(cf / cpus); if (int(mf / mem) < fit) fit = int(mf / mem); if (fit < 0) fit = 0
   if (!show_all && gt == 0) { cpu_only++; next }
+  if (st ~ /-$/) { fit = 0; planned++ }                  # "mixed-": reserved by backfill for a waiting job
+  if (st ~ /^completing/ && gf > 0) completing++
   if (only_fit && fit == 0) next
-  printf "%-12s %-10s %-10s %6d/%-2d %7d/%-2d %9d/%-3d %5d  %s\n", node, p, (gt ? gtype($3, $9) : "-"), gf, gt, cf, ct, mf, mt, fit, st
+  printf "%-12s %-10s %-14s %6d/%-2d %7d/%-2d %9d/%-3d %5d  %s\n", node, p, (gt ? gtype($3, $9) : "-"), gf, gt, cf, ct, mf, mt, fit, st
   tg += gf; tf += fit; if (gf > 0) ng++
 }
-END { if (cpu_only) printf "(%d node(s) without GPUs hidden; -a shows them)\n", cpu_only
+END { if (planned) printf "(%d node(s) ending in \"-\" are planned: Slurm holds them for a waiting job, FITS 0)\n", planned
+      if (completing) printf "(%d node(s) completing: a job is ending there, its GPUs free up shortly)\n", completing
+      if (cpu_only) printf "(%d node(s) without GPUs hidden; -a shows them)\n", cpu_only
       printf "TOTAL: %d free GPU(s) on %d node(s); %d job(s) of %d CPU + %d GB per GPU fit now\n", tg, ng, tf, cpus, mem }'
