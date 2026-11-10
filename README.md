@@ -1,6 +1,7 @@
 # slurm-gpu-tools
 
 Small, read-only helpers for finding GPUs on a Slurm cluster. No root, no accounting DB needed: only `sinfo`.
+
 This project stems from my own necessities: I often find my self working with a SLURM cluster and it can be convoluted and hard to figure out exactly how to operate it with the overhead there is. Sometimes simple things should be simple. I hope this tool can be as useful to others as it is for me.
 
 ## sgpu
