@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# sgpu - free GPUs, CPUs and memory per Slurm node, and how many jobs of a given size fit.
+# Read-only: uses only `sinfo`. Works on any Slurm cluster with GPU GRES (gpu:<type>:<n> or gpu:<n>).
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+usage: sgpu [-f] [-p PARTITION] [-c CPUS_PER_GPU] [-m MEM_GB_PER_GPU] [-h]
+  -f    only nodes where at least one job of the given size fits
+  -p    only this partition (default: all)
+  -c    CPUs a 1-GPU job needs   (default 8,  env SGPU_CPUS)
+  -m    GB of memory per 1-GPU job (default 24, env SGPU_MEM_GB)
+FITS = how many 1-GPU jobs of that size the node can start now = min(free GPUs, free CPUs / c, free GB / m).
+USAGE
+}
+
+only_fit=0; part=""; cpus="${SGPU_CPUS:-8}"; mem="${SGPU_MEM_GB:-24}"
+while getopts "fp:c:m:h" o; do
+  case "$o" in
+    f) only_fit=1 ;; p) part="$OPTARG" ;; c) cpus="$OPTARG" ;; m) mem="$OPTARG" ;;
+    h) usage; exit 0 ;; *) usage >&2; exit 2 ;;
+  esac
+done
+
+sinfo -N -h ${part:+-p "$part"} -O "NodeHost:30,Partition:20,Gres:40,GresUsed:60,CPUsState:24,AllocMem:14,Memory:14,StateLong:20" |
+awk -v only_fit="$only_fit" -v cpus="$cpus" -v mem="$mem" '
+function gpus(s,    n, a) { sub(/\(.*/, "", s); if (s !~ /^gpu/) return 0; n = split(s, a, ":"); return a[n] + 0 }
+BEGIN { printf "%-12s %-10s %9s %10s %12s %5s  %s\n", "NODE", "PART", "GPU free", "CPU free", "MEM free GB", "FITS", "STATE" }
+!seen[$1]++ {
+  node = $1; p = $2; sub(/\*$/, "", p)
+  gt = gpus($3); gu = gpus($4)                        # Gres gpu:A6000:3 / GresUsed gpu:A6000:1(IDX:0)
+  split($5, c, "/"); cf = c[2] + 0; ct = c[4] + 0     # CPUsState alloc/idle/other/total
+  mf = int(($7 - $6) / 1024); mt = int($7 / 1024); st = $8
+  gf = gt - gu; if (st ~ /drain|down|maint|reserved|fail/) gf = 0
+  fit = gf; if (int(cf / cpus) < fit) fit = int(cf / cpus); if (int(mf / mem) < fit) fit = int(mf / mem); if (fit < 0) fit = 0
+  if (only_fit && fit == 0) next
+  printf "%-12s %-10s %6d/%-2d %7d/%-2d %9d/%-3d %5d  %s\n", node, p, gf, gt, cf, ct, mf, mt, fit, st
+  tg += gf; tf += fit; if (gf > 0) ng++
+}
+END { printf "TOTAL: %d free GPU(s) on %d node(s); %d job(s) of %d CPU + %d GB per GPU fit now\n", tg, ng, tf, cpus, mem }'
