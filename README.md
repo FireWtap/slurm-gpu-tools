@@ -28,6 +28,34 @@ sgpu -c 16 -m 64     size of one 1-GPU job: 16 CPUs, 64 GB (defaults 8 CPU / 24 
 `FITS = min(free GPUs, free CPUs / c, free GB / m)`. Nodes that are drained, down, failed or in maintenance count as 0.
 GPU counts come from `sinfo -O Gres,GresUsed`, so GRES must be `gpu:<type>:<n>` or `gpu:<n>`.
 
+## swhen
+
+When will a GPU job of your size fit? Forecast from the running jobs' end times (start + time limit) and the queue.
+
+```
+$ swhen                      # 1 GPU, 8 CPU, 24 GB (defaults), partition defq
+NODE       GPUs free  next GPU frees             your job fits here
+node401    3/3        now                        now
+node405    0/3        today 16:15 (2h01m)        today 16:15 (2h01m)
+node412    1/3        now                        tomorrow 00:35 (10h20m)
+...
+optimistic  : NOW  on node401, node402, node411
+with queue  : NOW  on node401, node402, node411   (1 pending GPU job(s) waiting for resources: ...)
+```
+
+```
+swhen -g 3 -m 40     3 GPUs on one node, 40 GB per GPU (CPUs: -c per GPU, default 8)
+swhen -p gpu_a100    another partition ('' = any)
+swhen -v             detailed release list per node (time, +GPU/CPU/GB, job id)
+```
+
+- *next GPU frees*: first time a GPU on that node is released. *your job fits here*: first time GPUs **and** CPUs
+  **and** memory for your job are free on that node (they differ when a node has a free GPU but no memory left).
+- *optimistic*: running jobs only. *with queue*: pending GPU jobs waiting for resources start first, in priority order,
+  then yours (a rough model of Slurm's scheduler).
+- End times are time limits, i.e. upper bounds: jobs often finish earlier, so real waits are usually shorter.
+- Read-only (`scontrol`), Python >= 3.6, standard library only.
+
 ## Install
 
 ```

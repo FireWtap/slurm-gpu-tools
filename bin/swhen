@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""swhen - when will a GPU job of my size fit? Forecast from running jobs' end times (+ the pending queue).
+
+Read-only: `scontrol show node` / `scontrol -d show job`. Python >= 3.6, standard library only.
+
+Model
+- Per node: GPUs, CPUs and memory in use now, from each running job's per-node allocation (scontrol -d).
+- A running job frees its resources at its EndTime (= start + time limit). That is an UPPER bound: jobs often end
+  early, so real waits are usually shorter.
+- optimistic : only running jobs; nobody else is waiting.
+- with queue : pending GPU jobs that wait for resources (Reason Resources/Priority, not Dependency/held) start first,
+  in priority order, whenever they fit (greedy, single node each); they then hold their resources for their time limit.
+  Your job goes last. A rough model of Slurm's scheduler, not a promise.
+
+usage: swhen [-g GPUS] [-c CPUS_PER_GPU] [-m MEM_GB_PER_GPU] [-p PARTITION] [-a] [-v [-n EVENTS]]
+"""
+import argparse
+import datetime as dt
+import os
+import re
+import subprocess
+import sys
+
+BAD_STATES = ('DRAIN', 'DOWN', 'FAIL', 'MAINT', 'RESERVED', 'NOT_RESPONDING', 'POWER')
+
+
+def sh(cmd):
+    return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True,
+                          check=False).stdout
+
+
+def kv(line):
+    """'A=1 B=x y C=2' -> dict; values never contain spaces in scontrol -o output except a few we do not use."""
+    out = {}
+    for tok in line.split():
+        if '=' in tok:
+            k, v = tok.split('=', 1)
+            out.setdefault(k, v)
+    return out
+
+
+def count_ids(spec):
+    """'0-3,8-11' -> 8"""
+    n = 0
+    for part in spec.split(','):
+        if not part:
+            continue
+        a, _, b = part.partition('-')
+        n += (int(b) - int(a) + 1) if b else 1
+    return n
+
+
+def gpus_in(gres):
+    """'gpu:A6000:1(IDX:2)' / 'gpu:2(IDX:0-1)' / 'gpu:1' / '(null)' -> int"""
+    if not gres or not gres.startswith('gpu'):
+        return 0
+    m = re.search(r'IDX:([0-9,\-]+)', gres)
+    if m:
+        return count_ids(m.group(1))
+    head = gres.split('(')[0].split(',')[0]
+    try:
+        return int(head.split(':')[-1])
+    except ValueError:
+        return 1
+
+
+def mem_mb(s):
+    """'24G' / '40960M' / '64G' / '1T' -> MB"""
+    m = re.match(r'([0-9.]+)([KMGT]?)', s or '')
+    if not m:
+        return 0
+    x = float(m.group(1))
+    return int(x * {'K': 1 / 1024, 'M': 1, 'G': 1024, 'T': 1024 * 1024, '': 1}[m.group(2)])
+
+
+def parse_time(s):
+    try:
+        return dt.datetime.strptime(s, '%Y-%m-%dT%H:%M:%S')
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_limit(s):
+    """'3-00:00:00' / '6:00:00' / '30:00' / 'UNLIMITED' -> timedelta"""
+    if not s or s in ('UNLIMITED', 'Partition_Limit', 'NONE'):
+        return dt.timedelta(days=5)
+    d, _, rest = s.rpartition('-')
+    parts = [int(p) for p in rest.split(':')]
+    while len(parts) < 3:
+        parts.insert(0, 0)
+    return dt.timedelta(days=int(d or 0), hours=parts[0], minutes=parts[1], seconds=parts[2])
+
+
+def expand_nodelist(s):
+    if not s or s == '(null)':
+        return []
+    return sh(['scontrol', 'show', 'hostnames', s]).split()
+
+
+class Node(object):
+    def __init__(self, d):
+        self.name = d['NodeName']
+        self.parts = d.get('Partitions', '').split(',')
+        self.state = d.get('State', '')
+        self.gpus = gpus_in(d.get('Gres', ''))
+        self.cpus = int(d.get('CPUTot', 0))
+        self.mem = int(d.get('RealMemory', 0))
+        self.used = [0, 0, 0]  # gpus, cpus, mem MB
+        self.usable = not any(b in self.state.upper() for b in BAD_STATES)
+
+    def free(self, used=None):
+        u = used or self.used
+        return self.gpus - u[0], self.cpus - u[1], self.mem - u[2]
+
+
+def fits(free, need):
+    return all(f >= n for f, n in zip(free, need))
+
+
+def load():
+    nodes = {}
+    for line in sh(['scontrol', '-o', 'show', 'node']).splitlines():
+        d = kv(line)
+        if 'NodeName' in d:
+            nodes[d['NodeName']] = Node(d)
+    running, pending = [], []
+    for line in sh(['scontrol', '-o', '-d', 'show', 'job']).splitlines():
+        d = kv(line)
+        st = d.get('JobState')
+        if st == 'RUNNING':
+            end = parse_time(d.get('EndTime'))
+            # per-node detail groups: "Nodes=x CPU_IDs=.. Mem=.. GRES=.."
+            for m in re.finditer(r'Nodes=(\S+) CPU_IDs=(\S+) Mem=(\d+) GRES=(\S*)', line):
+                for n in expand_nodelist(m.group(1)):
+                    running.append(dict(job=d['JobId'], user=d.get('UserId', '').split('(')[0], node=n, end=end,
+                                        need=(gpus_in(m.group(4)), count_ids(m.group(2)), int(m.group(3)))))
+        elif st == 'PENDING':
+            g = gpus_in(d.get('TresPerNode', ''))
+            reason = d.get('Reason', '')
+            if g == 0 or reason not in ('Resources', 'Priority', 'None'):
+                continue  # Dependency / held / limits: not competing right now
+            nn = int(d.get('NumNodes', '1').split('-')[0] or 1)
+            cpus = max(1, int(d.get('NumCPUs', '1').split('-')[0]) // max(nn, 1))
+            mem = mem_mb(d.get('MinMemoryNode')) if d.get('MinMemoryNode') else mem_mb(d.get('MinMemoryCPU')) * cpus
+            pending.append(dict(job=d['JobId'], user=d.get('UserId', '').split('(')[0], prio=int(d.get('Priority', 0)),
+                                part=d.get('Partition', '').split(','), req=expand_nodelist(d.get('ReqNodeList')),
+                                nodes=nn, need=(g, cpus, mem), limit=parse_limit(d.get('TimeLimit')), reason=reason))
+    for r in running:
+        if r['node'] in nodes:
+            u = nodes[r['node']].used
+            for i in range(3):
+                u[i] += r['need'][i]
+    pending.sort(key=lambda p: -p['prio'])
+    return nodes, running, pending
+
+
+def eligible(node, part, req=None):
+    return node.usable and (not part or part in node.parts) and (not req or node.name in req)
+
+
+def forecast(nodes, running, pending, need, part, now, with_queue):
+    """Earliest (time, node) at which `need` fits on one node of `part`. Event-driven simulation."""
+    used = {n: list(nodes[n].used) for n in nodes}
+    releases = [(r['end'] or now, r['node'], r['need']) for r in running]
+    queue = [dict(p) for p in pending] if with_queue else []
+    t = now
+    horizon = now + dt.timedelta(days=30)
+    while True:
+        # release everything that ended by t
+        keep = []
+        for end, n, nd in releases:
+            if end <= t and n in used:
+                for i in range(3):
+                    used[n][i] -= nd[i]
+            elif end > t:
+                keep.append((end, n, nd))
+        releases = keep
+        # queued jobs ahead of us start greedily in priority order (single node each; multi-node: all on distinct nodes)
+        started = True
+        while started and queue:
+            started = False
+            for p in list(queue):
+                cand = [n for n in sorted(nodes) if eligible(nodes[n], p['part'][0] if p['part'] else None, p['req'])
+                        and fits(nodes[n].free(used[n]), p['need'])]
+                if len(cand) >= p['nodes']:
+                    for n in cand[:p['nodes']]:
+                        for i in range(3):
+                            used[n][i] += p['need'][i]
+                        releases.append((t + p['limit'], n, p['need']))
+                    queue.remove(p)
+                    started = True
+        # does our job fit now?
+        hit = [n for n in sorted(nodes) if eligible(nodes[n], part) and fits(nodes[n].free(used[n]), need)]
+        if hit:
+            return t, hit
+        future = sorted(e for e, _, _ in releases if e > t)
+        if not future or future[0] > horizon:
+            return None, []
+        t = future[0]
+
+
+def human(td):
+    s = int(td.total_seconds())
+    if s <= 0:
+        return 'now'
+    d, s = divmod(s, 86400)
+    h, s = divmod(s, 3600)
+    m = s // 60
+    return ('%dd%02dh' % (d, h)) if d else ('%dh%02dm' % (h, m)) if h else ('%dm' % m)
+
+
+def short(t, now):
+    """'now' | 'today 16:33 (2h23m)' | 'Thu 12:02 (1d22h)' | 'never (job too big)'"""
+    if t is None:
+        return 'never (too big for node)'
+    if t <= now:
+        return 'now'
+    day = 'today' if t.date() == now.date() else ('tomorrow' if (t.date() - now.date()).days == 1 else t.strftime('%a'))
+    return '%s %s (%s)' % (day, t.strftime('%H:%M'), human(t - now))
+
+
+def when(t, now):
+    if t is None:
+        return 'not within 30 days'
+    if t <= now:
+        return 'NOW'
+    return '%s  (in %s)' % (t.strftime('%a %d %b %H:%M'), human(t - now))
+
+
+def main():
+    ap = argparse.ArgumentParser(description='Forecast when a GPU job of your size fits (upper-bound end times).')
+    ap.add_argument('-g', type=int, default=1, help='GPUs on one node (default 1)')
+    ap.add_argument('-c', type=int, default=int(os.environ.get('SGPU_CPUS', 8)), help='CPUs per GPU (default 8)')
+    ap.add_argument('-m', type=float, default=float(os.environ.get('SGPU_MEM_GB', 24)), help='GB per GPU (default 24)')
+    ap.add_argument('-p', default='defq', help="partition (default defq; '' = any)")
+    ap.add_argument('-n', type=int, default=3, help='release events shown per node (default 3)')
+    ap.add_argument('-a', action='store_true', help='show all nodes, not only those in the partition')
+    ap.add_argument('-v', action='store_true', help='detailed release list per node (time, +GPU/CPU/GB, job id)')
+    a = ap.parse_args()
+
+    now = dt.datetime.now().replace(microsecond=0)
+    nodes, running, pending = load()
+    need = (a.g, a.c * a.g, int(a.m * 1024 * a.g))
+    part = a.p or None
+
+    print('Job: %d GPU, %d CPU, %.0f GB on one node%s.   Now %s' % (
+        a.g, need[1], need[2] / 1024, (' in ' + part) if part else '', now.strftime('%a %d %b %H:%M')))
+    print()
+    if a.v:
+        print('%-10s %-8s %-15s %s' % ('NODE', 'FREE NOW', 'GPU/CPU/GB', 'NEXT RELEASES (time  +GPU/CPU/GB  job)'))
+    else:
+        print('%-10s %-10s %-26s %s' % ('NODE', 'GPUs free', 'next GPU frees', 'your job fits here'))
+    for name in sorted(nodes):
+        nd = nodes[name]
+        if not a.a and part and part not in nd.parts:
+            continue
+        g, c, m = nd.free()
+        rel = sorted((r for r in running if r['node'] == name and r['end']), key=lambda r: r['end'])
+        if a.v:
+            ev = ['%s +%d/%d/%d %s' % (r['end'].strftime('%a %H:%M'), r['need'][0], r['need'][1], r['need'][2] // 1024,
+                                       r['job']) for r in rel[:a.n]]
+            more = ' ...+%d' % (len(rel) - a.n) if len(rel) > a.n else ''
+            tag = 'fits' if nd.usable and fits((g, c, m), need) else ('n/a' if not nd.usable else '')
+            print('%-10s %-8s %-15s %s%s' % (name, tag, '%d/%d/%d' % (g, c, m // 1024), '  '.join(ev) or '-', more))
+            continue
+        if not nd.usable:
+            print('%-10s %-10s %-26s %s' % (name, '-', '-', 'unavailable (%s)' % nd.state.lower()))
+            continue
+        # next GPU: now if one is free, else the first release that returns a GPU
+        nxt = now if g > 0 else next((r['end'] for r in rel if r['need'][0] > 0), None)
+        # your job on THIS node: walk its releases until free >= need (running jobs only)
+        free, t_fit = [g, c, m], None
+        if fits(free, need):
+            t_fit = now
+        else:
+            for r in rel:
+                for i in range(3):
+                    free[i] += r['need'][i]
+                if fits(free, need):
+                    t_fit = r['end']
+                    break
+        print('%-10s %-10s %-26s %s' % (name, '%d/%d' % (g, nd.gpus), short(nxt, now), short(t_fit, now)))
+    print()
+    ahead = [p for p in pending if (not part or not p['part'] or part in p['part'])]
+    t_opt, n_opt = forecast(nodes, running, pending, need, part, now, False)
+    t_q, n_q = forecast(nodes, running, pending, need, part, now, True)
+    print('optimistic  : %s%s' % (when(t_opt, now), ('  on ' + ', '.join(n_opt[:4])) if n_opt else ''))
+    print('with queue  : %s%s   (%d pending GPU job(s) waiting for resources%s)' % (
+        when(t_q, now), ('  on ' + ', '.join(n_q[:4])) if n_q else '', len(pending),
+        ': ' + ', '.join('%s %s %dG' % (p['job'], p['user'], p['need'][0]) for p in pending[:4]) if pending else ''))
+    print('note        : end times are time limits (upper bounds); jobs often finish earlier.')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
