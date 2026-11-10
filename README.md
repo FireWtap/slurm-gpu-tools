@@ -21,6 +21,7 @@ TOTAL: 6 free GPU(s) on 3 node(s); 4 job(s) of 8 CPU + 40 GB per GPU fit now
 ```
 sgpu                 all nodes
 sgpu -f              only nodes where a job fits
+sgpu -a              also list nodes without GPUs (hidden by default)
 sgpu -p gpu_a100     one partition
 sgpu -c 16 -m 64     size of one 1-GPU job: 16 CPUs, 64 GB (defaults 8 CPU / 24 GB; env SGPU_CPUS, SGPU_MEM_GB)
 ```
